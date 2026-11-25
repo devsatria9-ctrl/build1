@@ -54,14 +54,65 @@ jobs:
           PROJECT_ROOT=$(cd "$(dirname "$PUBSPEC")" && pwd)
           echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
           echo "BUILD_TYPE=$BUILD_TYPE" >> "$GITHUB_ENV"
+          # Nama app + ikon (dari .flutterapk Nama App / .apkicon)
+          ICON_URL=$(jq -r '.iconUrl // empty' payload.json)
+          rm -f /tmp/icon_raw
+          if [ -n "$ICON_URL" ]; then
+            curl -fL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/octet-stream" -o /tmp/icon_raw "$ICON_URL" || rm -f /tmp/icon_raw
+          fi
+          jq -r '.appName // empty' payload.json > /tmp/app_name.txt
+          jq -r '.fallbackName // empty' payload.json > /tmp/fallback_name.txt
       - name: Build APK
         run: |
           set -e
           cd "$PROJECT_ROOT"
+          GENERATED=0
           if [ ! -d android ]; then
             echo "Folder android/ tidak ada, dibuat otomatis..."
-            flutter create . --platforms=android --project-name app_build
+            GENERATED=1
+            # nama pakej Dart ikut pubspec.yaml (bukan lagi 'app_build' tetap)
+            PKG=$(grep -m1 -E '^name:' pubspec.yaml | sed -E 's/^name:[[:space:]]*//; s/["'"'"'\r ]//g')
+            [ -z "$PKG" ] && PKG=app_build
+            flutter create . --platforms=android --project-name "$PKG"
           fi
+          APP_NAME=$(cat /tmp/app_name.txt 2>/dev/null || true)
+          [ -z "$APP_NAME" ] && [ "$GENERATED" = "1" ] && APP_NAME=$(cat /tmp/fallback_name.txt 2>/dev/null || true)
+          export APP_NAME GENERATED
+          python3 - <<'PY'
+          import os, re, glob, subprocess
+          from xml.sax.saxutils import escape
+          name = os.environ.get("APP_NAME", "").strip()
+          generated = os.environ.get("GENERATED") == "1"
+          manifest = "android/app/src/main/AndroidManifest.xml"
+          if name and os.path.exists(manifest):
+              m = open(manifest, encoding="utf8").read()
+              m2 = re.sub(r'android:label="[^"]*"', lambda _: 'android:label="%s"' % escape(name, {'"': "&quot;"}), m, count=1)
+              open(manifest, "w", encoding="utf8").write(m2)
+              print("label ->", name)
+          res = "android/app/src/main/res"
+          raw = "/tmp/icon_raw"
+          have_raw = os.path.exists(raw) and os.path.getsize(raw) > 0
+          if (have_raw or generated) and os.path.isdir(res):
+              for f in glob.glob(res + "/mipmap-*/ic_launcher*") + glob.glob(res + "/drawable*/ic_launcher*"):
+                  try: os.remove(f)
+                  except Exception: pass
+              if os.path.exists(manifest):
+                  m = open(manifest, encoding="utf8").read()
+                  m = re.sub(r'\s+android:roundIcon="[^"]*"', "", m)
+                  if 'android:icon=' not in m:
+                      m = m.replace("<application", '<application android:icon="@mipmap/ic_launcher"', 1)
+                  open(manifest, "w", encoding="utf8").write(m)
+              letter = (re.sub(r"[^A-Za-z0-9]", "", name)[:1].upper() or "A")
+              for d, px in (("mdpi", 48), ("hdpi", 72), ("xhdpi", 96), ("xxhdpi", 144), ("xxxhdpi", 192)):
+                  out = "%s/mipmap-%s/ic_launcher.png" % (res, d)
+                  os.makedirs(os.path.dirname(out), exist_ok=True)
+                  if have_raw:
+                      subprocess.check_call(["convert", raw + "[0]", "-resize", "%dx%d!" % (px, px), "PNG32:" + out])
+                  else:
+                      subprocess.check_call(["convert", "-size", "%dx%d" % (px, px), "xc:#2563eb", "-gravity", "center",
+                                             "-fill", "white", "-pointsize", str(int(px * 0.57)), "-annotate", "0", letter, "PNG32:" + out])
+              print("icon ->", "custom" if have_raw else "huruf " + letter)
+          PY
           flutter pub get
           if [ "$BUILD_TYPE" = "debug" ]; then
             flutter build apk --debug
