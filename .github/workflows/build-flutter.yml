@@ -70,48 +70,74 @@ jobs:
           if [ ! -d android ]; then
             echo "Folder android/ tidak ada, dibuat otomatis..."
             GENERATED=1
-            # nama pakej Dart ikut pubspec.yaml (bukan lagi 'app_build' tetap)
-            PKG=$(grep -m1 -E '^name:' pubspec.yaml | sed -E 's/^name:[[:space:]]*//; s/["'"'"'\r ]//g')
-            [ -z "$PKG" ] && PKG=app_build
-            flutter create . --platforms=android --project-name "$PKG"
+            # nama pakej Dart ikut pubspec.yaml; tak sah / kosong = 'app_build' (cara lama yang terbukti jalan)
+            PKG=$(grep -m1 -E '^name:' pubspec.yaml | sed -E 's/^name:[[:space:]]*//' | tr -d "\"' \r" || true)
+            if ! printf '%s' "$PKG" | grep -qE '^[a-z][a-z0-9_]*$'; then PKG=app_build; fi
+            if ! flutter create . --platforms=android --project-name "$PKG"; then
+              echo "::warning::flutter create gagal dengan nama $PKG, cuba app_build"
+              flutter create . --platforms=android --project-name app_build
+            fi
           fi
           APP_NAME=$(cat /tmp/app_name.txt 2>/dev/null || true)
-          [ -z "$APP_NAME" ] && [ "$GENERATED" = "1" ] && APP_NAME=$(cat /tmp/fallback_name.txt 2>/dev/null || true)
+          if [ -z "$APP_NAME" ] && [ "$GENERATED" = "1" ]; then APP_NAME=$(cat /tmp/fallback_name.txt 2>/dev/null || true); fi
           export APP_NAME GENERATED
-          python3 - <<'PY'
-          import os, re, glob, subprocess
+          # Nama + ikon: TIDAK BOLEH menggagalkan build. Kalau ralat, build diteruskan dengan ikon/nama asal.
+          python3 - <<'PY' || echo "::warning::nama/ikon gagal diterapkan, build diteruskan"
+          import os, re, glob, shutil, subprocess, tempfile
           from xml.sax.saxutils import escape
           name = os.environ.get("APP_NAME", "").strip()
           generated = os.environ.get("GENERATED") == "1"
           manifest = "android/app/src/main/AndroidManifest.xml"
-          if name and os.path.exists(manifest):
-              m = open(manifest, encoding="utf8").read()
-              m2 = re.sub(r'android:label="[^"]*"', lambda _: 'android:label="%s"' % escape(name, {'"': "&quot;"}), m, count=1)
-              open(manifest, "w", encoding="utf8").write(m2)
-              print("label ->", name)
           res = "android/app/src/main/res"
-          raw = "/tmp/icon_raw"
-          have_raw = os.path.exists(raw) and os.path.getsize(raw) > 0
-          if (have_raw or generated) and os.path.isdir(res):
-              for f in glob.glob(res + "/mipmap-*/ic_launcher*") + glob.glob(res + "/drawable*/ic_launcher*"):
-                  try: os.remove(f)
-                  except Exception: pass
-              if os.path.exists(manifest):
+
+          # 1) label
+          try:
+              if name and os.path.exists(manifest):
                   m = open(manifest, encoding="utf8").read()
-                  m = re.sub(r'\s+android:roundIcon="[^"]*"', "", m)
-                  if 'android:icon=' not in m:
-                      m = m.replace("<application", '<application android:icon="@mipmap/ic_launcher"', 1)
-                  open(manifest, "w", encoding="utf8").write(m)
-              letter = (re.sub(r"[^A-Za-z0-9]", "", name)[:1].upper() or "A")
-              for d, px in (("mdpi", 48), ("hdpi", 72), ("xhdpi", 96), ("xxhdpi", 144), ("xxxhdpi", 192)):
-                  out = "%s/mipmap-%s/ic_launcher.png" % (res, d)
-                  os.makedirs(os.path.dirname(out), exist_ok=True)
-                  if have_raw:
-                      subprocess.check_call(["convert", raw + "[0]", "-resize", "%dx%d!" % (px, px), "PNG32:" + out])
-                  else:
-                      subprocess.check_call(["convert", "-size", "%dx%d" % (px, px), "xc:#2563eb", "-gravity", "center",
-                                             "-fill", "white", "-pointsize", str(int(px * 0.57)), "-annotate", "0", letter, "PNG32:" + out])
-              print("icon ->", "custom" if have_raw else "huruf " + letter)
+                  m2 = re.sub(r'android:label="[^"]*"', lambda _: 'android:label="%s"' % escape(name, {'"': "&quot;"}), m, count=1)
+                  open(manifest, "w", encoding="utf8").write(m2)
+                  print("label ->", name)
+          except Exception as e:
+              print("label gagal:", e)
+
+          # 2) ikon: jana semua saiz ke folder sementara DAHULU; hanya kalau semua berjaya baru ganti ikon asal
+          try:
+              raw = "/tmp/icon_raw"
+              have_raw = os.path.exists(raw) and os.path.getsize(raw) > 0
+              im = shutil.which("convert") or shutil.which("magick")
+              if (have_raw or generated) and os.path.isdir(res) and im:
+                  tmp = tempfile.mkdtemp()
+                  letter = (re.sub(r"[^A-Za-z0-9]", "", name)[:1].upper() or "A")
+                  made = {}
+                  for d, px in (("mdpi", 48), ("hdpi", 72), ("xhdpi", 96), ("xxhdpi", 144), ("xxxhdpi", 192)):
+                      out = os.path.join(tmp, d + ".png")
+                      if have_raw:
+                          cmd = [im, raw + "[0]", "-background", "none", "-resize", "%dx%d!" % (px, px), "PNG32:" + out]
+                      else:
+                          cmd = [im, "-size", "%dx%d" % (px, px), "xc:#2563eb", "-gravity", "center", "-fill", "white",
+                                 "-pointsize", str(int(px * 0.57)), "-annotate", "0", letter, "PNG32:" + out]
+                      subprocess.check_call(cmd)
+                      if not (os.path.exists(out) and os.path.getsize(out) > 0):
+                          raise RuntimeError("ikon %s kosong" % d)
+                      made[d] = out
+                  for f in glob.glob(res + "/mipmap-*/ic_launcher*") + glob.glob(res + "/drawable*/ic_launcher*"):
+                      try: os.remove(f)
+                      except Exception: pass
+                  for d, out in made.items():
+                      dst = "%s/mipmap-%s/ic_launcher.png" % (res, d)
+                      os.makedirs(os.path.dirname(dst), exist_ok=True)
+                      shutil.copyfile(out, dst)
+                  if os.path.exists(manifest):
+                      m = open(manifest, encoding="utf8").read()
+                      m = re.sub(r'\s+android:roundIcon="[^"]*"', "", m)
+                      if 'android:icon=' not in m:
+                          m = m.replace("<application", '<application android:icon="@mipmap/ic_launcher"', 1)
+                      open(manifest, "w", encoding="utf8").write(m)
+                  print("icon ->", "custom" if have_raw else "huruf " + letter)
+              else:
+                  print("icon: dilangkau (tiada gambar / ImageMagick)")
+          except Exception as e:
+              print("icon gagal, guna ikon asal:", e)
           PY
           flutter pub get
           if [ "$BUILD_TYPE" = "debug" ]; then
